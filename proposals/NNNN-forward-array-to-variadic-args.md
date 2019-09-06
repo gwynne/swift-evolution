@@ -5,9 +5,13 @@
 * Review Manager: TBD
 * Status: **Awaiting implementation**
 * Implementation: [apple/swift#NNNNN](https://github.com/apple/swift/pull/NNNNN)
-* Decision Notes: [Rationale](https://forums.swift.org/), [Additional Commentary](https://forums.swift.org/)
-* Bugs: [SR-128 Pass array to variadic function](https://bugs.swift.org/browse/SR-128)
-* Previous Revision: None
+* Decision Notes: [Rationale](https://forums.swift.org/), [Additional](https://forums.swift.org/t/array-splatting-for-variadic-parameters/7175/) [commentary](https://forums.swift.org/t/variadic-parameters-that-accept-array-inputs/12711/) [from](https://forums.swift.org/t/explicit-array-splat-for-variadic-functions/11326) [community](https://forums.swift.org/t/pitch-variadic-arguments-should-accept-arrays/5327)
+* Bugs:
+  - [SR-128 Pass array to variadic function](https://bugs.swift.org/browse/SR-128)
+  - [SR-1644 Issue with varargs](https://bugs.swift.org/browse/SR-1644)
+  - [SR-4386 variadic parameters are interpreted as single argument when passed on](https://bugs.swift.org/browse/SR-4386)
+  - [SR-9733 No Syntax for Array Splat](https://bugs.swift.org/browse/SR-9733)
+* Previous Revision: [Early proposal #1](https://github.com/ArtSabintsev/swift-evolution/blob/master/proposals/array-variadic-function.md)
 
 ## Introduction
 
@@ -108,7 +112,9 @@ func my_os_log(_ message: StaticString, log: OSLog = .default, type: OSLogType =
 }
 ```
 
-This is unsafe because when functions like `os_log()` are imported from C, there are larger concerns than the "arrays of Hanoi": `Array` bridges transparently as a `CVarArg`. If a caller tries to pass the `args` array to `os_log()`, it would be interpreted as a single argument and bridged as a C pointer. The compiler will emit no complaint or even warning, and the most likely result is a crashed process. By convention, most C functions using the `va_list` mechanism have a "`v`" variant - such as `vprintf()` or `NSLogv()` - which accepts the `CVaListPointer` available via `withVaList(args)`, but `os_log()` does not. As a result, it's nearly impossible to use it safely from Swift without the ability to forward the variadic parameter.
+The safety problem comes in when functions like `os_log()` are imported from C: When an `Array` is passed to a variadic function which takes type `CVarArg...`, it transparently bridges over as a single argument. Thus, if a caller passes the `args` array to `os_log()`, all the function sees is a single C pointer, not an array of arguments. The compiler will emit no complaint or even warning, and the most likely result is a crashed process. By convention, most C functions using the `va_list` mechanism have a "`v`" variant - such as `vprintf()` or `NSLogv()` - which accepts the `CVaListPointer` available via `withVaList(args)`, but `os_log()` does not. As a result, it's nearly impossible to use it safely from Swift without the ability to forward the variadic parameter.
+
+_Note: It's probably just as well that `os_log()` and its ilk are left with larger concerns than the proverbial arrays of Hanoi. Without bigger problems to tackle, someone would probably try to make `gyb` an official part of the language or run Swift through `cpp(1)`._
 
 ## Proposed solution
 
@@ -206,18 +212,17 @@ This is just another version of explicitly providing an overload, and suffers fr
 
 This is the approach taken by the `os_log()` example back in the Motivation section. This obviously quickly becomes miserable to maintain even with such tools as `gyb`, and has no hope of scaling past a couple dozen elements at best. For good measure, it can also - depending on the types of the values involved - suffer from ambiguity issues, though less often than the array-taking overload.
 
-### Use <some language's> operator for the splat operation instead of a compiler directive
+### Use &lt;some language&gt;'s operator for the splat operation instead of a compiler directive
 
 There are plenty of languages which provide the "splat" operation using an operator. PHP and JavaScript use unary prefix `...`, though JavaScript calls it "spreading". Scala uses `_*`. Perl, Ruby, and Python have `*` (and the latter two additionally use `**`).
 
 For good measure, C# has the `params` keyword which sidesteps the issue by accepting both arguments lists and arrays transparently, and C has an exceedingly awkward ability to "forward" variadic parameters using `va_list` (though since arrays are not first-class types in C, there's doesn't really exist anything on which to perform a splat operation anyhow).
 
-- The `...` operator already has multiple meanings in Swift - in particular for specifying `ClosedRange`s and `UnboundedRange`s, not to mention of course variadic parameters themselves. It would not be practical to assign it yet another meaning.
 - The `*` operator has a long, sordid history in C and Objective-C, and would doubtlessly be confusing at best to many Swift developers. There is also a potential ambiguity with vector operations and of course the multiplication operator. Nor does it necessarily suggest the splat operation at first or even second glance.
 - Scala's `_*` operator suffers from the same confusion issue.
 - C#'s keyword would have the overload ambiguity problem mentioned above
 
-The author considered a number of other possible operators as well, none of which could be considered sufficiently intuitive or unambiguous. Here's just a few of the discarded options, several of them more in jest than anything else:
+The author considered a number of possible operators, none of which could be considered sufficiently intuitive or unambiguous (don't worry, `...` wasn't forgotten; the best is just saved for last). Here are some of the discarded options, some of which are just plain silly:
 
 - `~array`
 - `->array`
@@ -228,6 +233,16 @@ The author considered a number of other possible operators as well, none of whic
 - `\\array`
 - `>array<`
 
+Last, but most certainly not least, many previous forms of this proposal have suggested that the existing use of `...` for variadic parameters (or its presence in PHP and/or JavaScript) is a strong argument in favor of reusing it to perform this related operation. This proposal considered that option and offers the following justifications for rejecting both the ellipsis operator specifically and any existing operator in general:
+
+- `...` already has five use cases: As a variadic function parameter marker, as a shorthand for constructing `ClosedRange`s (infix), as a shorthand for `PartialRangeUpTo` (prefix), as shorthand for `PartialRangeFrom` (postfix), and as the interface to constructing `UnboundedRange`s. This is already too many meanings to assign to any one operator.
+
+- The use of `...` for variadic parameters dates back to before Swift was open source; it was effectively copied from [Objective-]C, at a time when the language creators had different goals, no supporting community, and a necessary lack of experience with how it would come to be used. That `...` is still used this way today is an historical accident, certainly not the only one to be found in Swift. Changing it now would require gargantuan effort, with little if any positive result. The present day Swift community and maintainers should be mindful of this historical context, but that context provides no justification whatsoever for ignoring the ellipsis operator's drawbacks just to provide a largely illusory sense of consistency. (The argument that such a sense would be illusory in fact, not just opinion, is addressed below.)
+
+- The ellipsis operator is unambiguous when it appears in a function declaration's `parameter-clause`, thanks to the language grammar. `...` as an operator may appear only in an `expression`, and a `default-argument-clause` is the only such production within a `parameter-clause`. `...` may also appear as a suffix on a `type-annotation`. However, in a `function-call-argument-list`, the ellipsis operator can appear almost anywhere. Even if the compiler experiences no ambiguity (which is difficult to guarantee), figuring out what `...`'s actual effect was in any given call could quickly become very difficult.
+
+- In present-day Swift, any non-restricted operator - including `...` - is subject to overloading by both the current module and any imported modules. The use of `...` for closed and unbounded ranges is implemented this way, by providing overloads strategically in the standard library. However, adding the "splat" operation - a compiler-internal operation inexpressible in the language itself - to `...` forces the compiler to either a) disable the "splat" operation entirely whenever an overload is in scope (effectively making it moot by preventing its use), or b) maintain additional semantics, machinery, and/or interfaces to resolve whether the user overload or the "splat" operation is invoked in any given context. (_Note: As a fun bonus, this effect strongly discourages the use of **any** overloadable operator for the "splat" function, in the same way that a standard library function would force extra work in the typesystem (see below)._)
+
 ### Call the directive `#splat()`, `#spread()`, `#forward()` etc.
 
 While the terms "splat" or "spread" for the operation in question are familiar to many, this is not universal. The author had never heard of the usage of "spread" for it until doing the research for this proposal. The term `forward` does not cover the full scope of the operation involved - it is valid for sending arrays to variadic parameters, not just forwarding inputs from other variadics.
@@ -237,11 +252,11 @@ In the end, "`variadic`" was settled on as:
 - Consistent with Swift's usage of the same word to describe the very function parameters it affects.
 - Being just unique enough a word to give it a low false positive rate when searched for - in other words, easy for beginners to find in the docs.
 
-### Use <some other construct> than a compiler directive
+### Use a language construct other than a compiler directive
 
-There are not many other language constructs which would be suitable for a situational modifier of this nature.
+First problem is, there aren't very many other language constructs which even _can_ serve as a situational modifier of this nature:
 
-- A standard library function would not tend to correctly convey the level at which the consideration is applied, and the type system has no means to express the "only valid where a variadic parameter goes" or "must be the only item passed to a variadic parameter" constraints.
+- A standard library function would not only misrepresent the level at which "splat" occurs, but run afoul of the type system, which has no means of expressing "only valid where a variadic parameter goes" or "must be the only item passed to a variadic parameter" constraints.
 - The `@identiifer` syntax is already used by property wrappers, and by built-in attributes. The splat operation is an active behavior of the compiler; it does not describe any particular innate characteristic of the related code.
 - `$` is already used by identifiers and property wrappers; reuse in this context would be ambiguous at best, directly conflicting at worst.
 - `\` also already has multiple meanings, and once again ambiguity would be quick to arise.
