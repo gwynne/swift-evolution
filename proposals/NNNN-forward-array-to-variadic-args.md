@@ -232,7 +232,10 @@ The author considered a number of other possible operators as well, none of whic
 
 While the terms "splat" or "spread" for the operation in question are familiar to many, this is not universal. The author had never heard of the usage of "spread" for it until doing the research for this proposal. The term `forward` does not cover the full scope of the operation involved - it is valid for sending arrays to variadic parameters, not just forwarding inputs from other variadics.
 
-In the end, "`variadic`" was settled on as being simultaneously both specific enough and encompassing enough to address the feature's scope without exceeding it. It is consistent with the language's own usage of "variadic" to describe such parameters. Also considered was that it provides an unambiguous term for those unfamiliar with the concept to look up, and stand a better than even chance of being accurately directed to relevant documentation.
+In the end, "`variadic`" was settled on as:
+- Simultaneously both specific enough and encompassing enough to address the feature's scope without exceeding it.
+- Consistent with Swift's usage of the same word to describe the very function parameters it affects.
+- Being just unique enough a word to give it a low false positive rate when searched for - in other words, easy for beginners to find in the docs.
 
 ### Use <some other construct> than a compiler directive
 
