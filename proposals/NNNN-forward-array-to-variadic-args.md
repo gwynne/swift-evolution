@@ -40,26 +40,75 @@ To get the desired result, the developer must do more work manually:
 1|2|3|4
 ```
 
-Or even this unfortunate example, which would be absurd in the context of `print()` but is the only option for correctly and safely wrapping `os_log()` in Swift at the time of this writing:
+In `print()`'s case, this limitation is annoying and perhaps a little inefficient to get around, but that's all. But in other cases, it becomes more serious. `Combine` deals with the inability to pass an array to a variadic parameter by declaring both forms of some methods:
 
 ```swift
-  4> // Note: This example doesn't add anything to os_log() that would not be
-  5> // possible by calling the original imported C function directly.
-  6> func my_os_log(_ message: StaticString, log: OSLog = .default, type: OSLogType = .default, _ args: CVarArg...) {
-  7.     switch args.count {
-  8.     case 0: os_log(message, log: log, type: type)
-  9.     case 1: os_log(message, log: log, type: type, args[0])
- 10.     case 2: os_log(message, log: log, type: type, args[0], args[1])
- 11.     case 3: os_log(message, log: log, type: type, args[0], args[1], args[2])
- 12.     case 4: os_log(message, log: log, type: type, args[0], args[1], args[2], args[3])
- 13.     case 5: os_log(message, log: log, type: type, args[0], args[1], args[2], args[3], args[4])
- 14.     default: fatalError("Can only handle five format specifiers.")
- 15.     }
- 16. }
- 17>
+extension Publisher {
+    public func append(_ elements: Self.Output...) ->
+        Publishers.Concatenate<Self, Publishers.Sequence<[Self.Output], Self.Failure>>
+
+    public func append<S>(_ elements: S) ->
+        Publishers.Concatenate<Self, Publishers.Sequence<S, Self.Failure>>
+        where S : Sequence, Self.Output == S.Element
+}
 ```
 
-Even more problematically for this particular usage, `Array` bridges transparently as a `CVarArg`. If a caller _does_ attempt to pass an `Array<CVarArg>` as the `args` parameter, it would be interpreted as a single argument bridged as a C pointer. The compiler will emit no complaint or even warning, and the most likely result is a crashed process.
+While the `Self.Output == S.Element` constraint on the second method makes it relatively safe to provide both forms of input in this case (except in odd cases like `Self.Output == Any`), the duplication remains a maintenance burden and potential source of confusion. And sometimes, generic constraints can't provide even partial safety - consider `Foundation.NSArray`:
+
+```swift
+extension NSArray {
+    public convenience init(objects elements: Any...)
+    @nonobjc public convenience init(array anArray: NSArray)
+}
+```
+
+The legacy design of `NSArray`'s Objective-C API accidentally avoided what would otherwise be an obvious problem when creating an array of arrays, thanks to the `array` label on the second initializer, but lacking that, the use of `Any` as the only possible element type would be an accident waiting to happen. An extra burden in maintenance and API bloat is once again imposed (if only theoretically in this particular instance).
+
+There are even cases where functionality is limited or even completely unavailable - for example, it's currently impossible to "forward" conformance to the `ExpressibleByArrayLiteral` and `ExpressibleByDictionaryLiteral` protocols, as seen here:
+
+```swift
+// Note: A common use for wrappers like these is helping handle data flowing through `Codable`.
+class MyUsefulWrapper<T: InterestingProtocol> {
+    /* useful wrapper things go here */
+}
+
+extension MyUsefulWrapper: ExpressibleByArrayLiteral where T: ExpressibleByArrayLiteral {
+    typealias ArrayLiteralElement = T.ArrayLiteralElement
+
+    init(arrayLiteral elements: Self.ArrayLiteralElement...) {
+        self.init(T.init(arrayLiteral: /* ... What goes here?? */))
+    }
+}
+
+extension MyUsefulWrapper: ExpressibleByDictionaryLiteral where T: ExpressibleByDictionaryLiteral {
+    typealias Key = T.Key, Value = T.Value
+
+    init(dictionaryLiteral elements: (Self.Key, Self.Value)...) {
+        self.init(T.init(dictionaryLiteral: /* ... What goes here?? */))
+    }
+}
+```
+
+It can be sort-of faked by writing out individual calls to the other type's initializer based on the number of elements in the input arrays, but at a major cost to clarity and maintainability, and it scales _very_ poorly. Another option is to require separate `init(forwardedArrayLiteral: [Self.ArrayLiteralElement])` and `init(forwardedDictionaryLiteral: [(Self.Key, Self.Value)])` methods in a protocol the target object must conform to, but that just pushes the problem out onto anything that ever uses the wrapper object.
+
+And finally, there is this truly unfortunate example, which stands as the only working - but still not safe! - option for wrapping `os_log()` in Swift at the time of this writing:
+
+```swift
+// Note: This doesn't actually add anything to os_log(), it's just a demo of the problem.
+func my_os_log(_ message: StaticString, log: OSLog = .default, type: OSLogType = .default, _ args: CVarArg...) {
+    switch args.count {
+        case 0: os_log(message, log: log, type: type)
+        case 1: os_log(message, log: log, type: type, args[0])
+        case 2: os_log(message, log: log, type: type, args[0], args[1])
+        case 3: os_log(message, log: log, type: type, args[0], args[1], args[2])
+        case 4: os_log(message, log: log, type: type, args[0], args[1], args[2], args[3])
+        case 5: os_log(message, log: log, type: type, args[0], args[1], args[2], args[3], args[4])
+        default: fatalError("Can only handle five format specifiers.")
+    }
+}
+```
+
+This is unsafe because when functions like `os_log()` are imported from C, there are larger concerns than the "arrays of Hanoi": `Array` bridges transparently as a `CVarArg`. If a caller tries to pass the `args` array to `os_log()`, it would be interpreted as a single argument and bridged as a C pointer. The compiler will emit no complaint or even warning, and the most likely result is a crashed process. By convention, most C functions using the `va_list` mechanism have a "`v`" variant - such as `vprintf()` or `NSLogv()` - which accepts the `CVaListPointer` available via `withVaList(args)`, but `os_log()` does not. As a result, it's nearly impossible to use it safely from Swift without the ability to forward the variadic parameter.
 
 ## Proposed solution
 
@@ -71,21 +120,20 @@ func my_os_log(_ message: StaticString, log: OSLog = .default, type: OSLogType =
 }
 ```
 
-The `#variadic()` directive performs a one-way transformation of an `Array<T>` into a `T...`. This value can only exist as the sole argument to a variadic parameter of identical type. It has no concrete type of its own and can not be stored or captured. See the Alternatives Considered section for a discussion of why a compiler directive was chosen as the proposed syntax.
+The `#variadic()` directive performs a one-way, zero-cost, compile-time reinterpretation of an `Array<T>` into a `T...`. This value can exist only as the sole argument to a variadic parameter of identical type; it has no concrete type of its own and can't be stored or captured. In essence, the compiler is told to just use the given array as the "real" parameter instead of faking or initializing one from the argument list.
+
+See the Alternatives Considered section for a detailed discussion of why a compiler directive was chosen as the proposed syntax. tl;dr version: Everything else was either confusing, already overused, or inappropriate to the task.
 
 ## Detailed design
 
-This proposal introduces a single additional compiler directive with the name `#variadic`. The directive has the same syntax as `#selector()`: a function-like invocation taking a single parameter. `#variadic` does not return a value, and is syntactically valid only as a function call argument. Grammatically, it is described simply as follows:
-
-```
-splat-expression → #variadic(expression)
-````
-
-The grammar of `function-call-argument` is additionally ammended to include the following production:
+This proposal introduces a single additional compiler directive with the name `#variadic`. The directive has a simple syntax: It takes a single array argument as if it were a function, and has no directly usable return value. It is syntactically valid only as a function call argument. Grammatically, `function-call-argument` is amended to include the following additional productions:
 
 ```
 function-call-argument → splat-expression | identifier : splat-expression
-```
+splat-expression → #variadic(expression)
+````
+
+Please note that `splat-expression` is **NOT** added to any productions for prefix, binary, primary, or postfix expressions. It is syntactically invalid anywhere outside a `function-call-argument`; in this respect the name of the production is somewhat misleading thanks to it semantic value. (For additional confusion, the `expression` _inside_ the `splat-expression` production **IS** a normal expression, and can do most things any other expression can do.)
 
 A `splat-expression` is _semantically_ valid only when ALL of the following conditions are true:
 
@@ -148,7 +196,7 @@ func multizip<T>(arrays: [T]) -> [T] where T: Collection { /* body */ }
 multizip([["a"], ["b"]])
 ```
 
-Even if the ambiguity could be resolved, such as by removing the variadic variant entirely (which would negate the value of the existing language feature altogether), this is often not possible. `os_log()`, for example, is provided by the OS and can not be augmented or avoided by user code. Similar issues will be encountered for any code using `CVarArg` (generally things imported from C/Objective-C). `print()` is yet another immediate example.
+Even if the ambiguity could be resolved, such as by removing the variadic variant entirely (which would negate the value of the existing language feature altogether) or constraining the type of `T.Element`, it is often not an option to even try. As was seen eariler, `os_log()` is provided by the OS and can not be augmented or avoided by user code. Similar issues will be encountered by any code importing `CVarArg`-using functions from C/Objective-C unless they have `v` variants. `print()` is yet another clear example - the parameter of `print()` and `debugPrint()` is, by design, `Any`; constraining it leaves it effectively useless..
 
 ### Allow `Array<T>` to implicitly convert to `T...`
 
@@ -196,3 +244,4 @@ There are not many other language constructs which would be suitable for a situa
 - `\` also already has multiple meanings, and once again ambiguity would be quick to arise.
 
 On the other hand, each directive currently introduced by `#` describes an active, (usually) compile-time effect - OS and compilation condition detection, Objective-C selector and keypath construction, and compile-time diagnostics, to name a few. The splat operation in Swift is a decision at compile-time to avoid synthesizing an array in favor of using one already available, which seems a reasonable fit.
+
